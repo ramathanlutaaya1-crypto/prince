@@ -70,6 +70,7 @@ struct DailyStats
    double dailyLoss;
    datetime sessionStart;
    bool dailyTargetReached;
+   int lastSessionDay;
 };
 
 DailyStats stats;
@@ -106,6 +107,7 @@ int OnInit()
    stats.dailyLoss = 0;
    stats.sessionStart = TimeCurrent();
    stats.dailyTargetReached = false;
+   stats.lastSessionDay = TimeDay(stats.sessionStart);
    
    Print("=== Professional Scalping Bot v2.0 ===");
    Print("Opening Balance: $", stats.openingBalance);
@@ -145,16 +147,18 @@ void OnTick()
    UpdateDailyStats();
    
    // Check daily loss limit
-   if (stats.dailyLoss >= (stats.openingBalance * MaxDailyLossPercent / 100))
+   if (stats.dailyLoss >= (stats.openingBalance * MaxDailyLossPercent / 100.0))
    {
       Print("Daily loss limit reached. Stopping trades...");
       return;
    }
    
    // Reset daily stats if new day
-   if (TimeDayOfWeek(stats.sessionStart) != TimeDayOfWeek(TimeCurrent()))
+   int currentDay = TimeDay(TimeCurrent());
+   if (stats.lastSessionDay != currentDay)
    {
       ResetDailyStats();
+      stats.lastSessionDay = currentDay;
    }
    
    // Process each trading pair
@@ -176,7 +180,8 @@ void OnTick()
 void ProcessPair(string symbol, int pairIndex)
 {
    // Avoid multiple trades on same bar
-   if (lastTradeTime[pairIndex] == iTime(symbol, Period(), 0))
+   datetime barTime = iTime(symbol, PERIOD_M5, 0);
+   if (lastTradeTime[pairIndex] == barTime)
       return;
    
    // Check max open trades limit
@@ -189,12 +194,12 @@ void ProcessPair(string symbol, int pairIndex)
    if (signal == 1)  // BUY signal
    {
       OpenScalpTrade(symbol, ORDER_TYPE_BUY, pairIndex);
-      lastTradeTime[pairIndex] = iTime(symbol, Period(), 0);
+      lastTradeTime[pairIndex] = barTime;
    }
    else if (signal == -1)  // SELL signal
    {
       OpenScalpTrade(symbol, ORDER_TYPE_SELL, pairIndex);
-      lastTradeTime[pairIndex] = iTime(symbol, Period(), 0);
+      lastTradeTime[pairIndex] = barTime;
    }
 }
 
@@ -242,22 +247,29 @@ void OpenScalpTrade(string symbol, ENUM_ORDER_TYPE orderType, int pairIndex)
    
    // Get current prices
    MqlTick tick;
-   SymbolInfoTick(symbol, tick);
+   if (!SymbolInfoTick(symbol, tick))
+   {
+      Print("Error: Could not get tick for ", symbol);
+      return;
+   }
+   
    double bid = tick.bid;
    double ask = tick.ask;
+   double pointValue = SymbolInfoDouble(symbol, SYMBOL_POINT);
    
    // Calculate SL and TP
-   double stopLoss, takeProfit;
+   double stopLoss = 0;
+   double takeProfit = 0;
    
    if (orderType == ORDER_TYPE_BUY)
    {
-      stopLoss = bid - (StopLoss_Pips * SymbolInfoDouble(symbol, SYMBOL_POINT));
-      takeProfit = ask + (TakeProfit_Pips * SymbolInfoDouble(symbol, SYMBOL_POINT));
+      stopLoss = bid - (StopLoss_Pips * pointValue);
+      takeProfit = ask + (TakeProfit_Pips * pointValue);
    }
    else
    {
-      stopLoss = ask + (StopLoss_Pips * SymbolInfoDouble(symbol, SYMBOL_POINT));
-      takeProfit = bid - (TakeProfit_Pips * SymbolInfoDouble(symbol, SYMBOL_POINT));
+      stopLoss = ask + (StopLoss_Pips * pointValue);
+      takeProfit = bid - (TakeProfit_Pips * pointValue);
    }
    
    // Normalize prices
@@ -268,9 +280,12 @@ void OpenScalpTrade(string symbol, ENUM_ORDER_TYPE orderType, int pairIndex)
    // Execute trade
    trade.SetExpertMagicNumber(pairMagic[pairIndex]);
    
+   bool result = false;
+   
    if (orderType == ORDER_TYPE_BUY)
    {
-      if (trade.Buy(lotSize, symbol, ask, stopLoss, takeProfit))
+      result = trade.Buy(lotSize, symbol, ask, stopLoss, takeProfit);
+      if (result)
       {
          Print("BUY opened: ", symbol, " | Lot: ", lotSize, " | SL: ", stopLoss, " | TP: ", takeProfit);
       }
@@ -281,7 +296,8 @@ void OpenScalpTrade(string symbol, ENUM_ORDER_TYPE orderType, int pairIndex)
    }
    else
    {
-      if (trade.Sell(lotSize, symbol, bid, stopLoss, takeProfit))
+      result = trade.Sell(lotSize, symbol, bid, stopLoss, takeProfit);
+      if (result)
       {
          Print("SELL opened: ", symbol, " | Lot: ", lotSize, " | SL: ", stopLoss, " | TP: ", takeProfit);
       }
@@ -302,28 +318,28 @@ double CalculateDynamicLotSize(string symbol)
    double maxLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
    double lotStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
    
-   double calculatedLot = 0;
+   double calculatedLot = 0.01;  // Default minimum
    
    // Dynamic lot sizing based on account balance stages
    if (balance < Stage1_Target)
    {
       // Stage 1: $2 to $100 - Micro lots
-      calculatedLot = 0.01 * (balance / 10);  // Scale up gradually
+      calculatedLot = 0.01 * (balance / 10.0);
    }
    else if (balance < Stage2_Target)
    {
       // Stage 2: $100 to $1000 - Mini lots
-      calculatedLot = 0.1 * (balance / 100);
+      calculatedLot = 0.1 * (balance / 100.0);
    }
    else if (balance < Stage3_Target)
    {
       // Stage 3: $1000 to $5000 - Standard lots
-      calculatedLot = 0.5 * (balance / 1000);
+      calculatedLot = 0.5 * (balance / 1000.0);
    }
    else
    {
       // Stage 4: $5000+ - Full lot scaling
-      calculatedLot = 1.0 * (balance / 5000);
+      calculatedLot = 1.0 * (balance / 5000.0);
    }
    
    // Ensure within broker limits
@@ -382,6 +398,7 @@ void ManageAllTrades()
          double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
          double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
          double stopLoss = PositionGetDouble(POSITION_SL);
+         double pointValue = SymbolInfoDouble(symbol, SYMBOL_POINT);
          
          ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
          
@@ -390,7 +407,7 @@ void ManageAllTrades()
          {
             if (posType == POSITION_TYPE_BUY && currentPrice > openPrice)
             {
-               double newStop = openPrice + (2 * SymbolInfoDouble(symbol, SYMBOL_POINT));
+               double newStop = openPrice + (2.0 * pointValue);
                if (newStop > stopLoss)
                {
                   trade.PositionModify(ticket, newStop, PositionGetDouble(POSITION_TP));
@@ -398,7 +415,7 @@ void ManageAllTrades()
             }
             else if (posType == POSITION_TYPE_SELL && currentPrice < openPrice)
             {
-               double newStop = openPrice - (2 * SymbolInfoDouble(symbol, SYMBOL_POINT));
+               double newStop = openPrice - (2.0 * pointValue);
                if (newStop < stopLoss)
                {
                   trade.PositionModify(ticket, newStop, PositionGetDouble(POSITION_TP));
@@ -417,10 +434,17 @@ void UpdateDailyStats()
    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    stats.dailyProfit = currentBalance - stats.openingBalance;
    
-   if (stats.dailyProfit >= DailyProfitTarget)
+   if (stats.dailyProfit < 0)
+      stats.dailyLoss = MathAbs(stats.dailyProfit);
+   else
+      stats.dailyLoss = 0;
+   
+   if (stats.dailyProfit >= DailyProfitTarget && !stats.dailyTargetReached)
    {
       stats.dailyTargetReached = true;
+      Print("==================================================");
       Print("✓ DAILY PROFIT TARGET REACHED: $", stats.dailyProfit);
+      Print("==================================================");
    }
 }
 
@@ -435,8 +459,10 @@ void ResetDailyStats()
    stats.sessionStart = TimeCurrent();
    stats.dailyTargetReached = false;
    
+   Print("==================================================");
    Print("=== NEW TRADING DAY ===");
    Print("Opening Balance: $", stats.openingBalance);
+   Print("==================================================");
 }
 
 //+------------------------------------------------------------------+
@@ -455,8 +481,10 @@ void CloseAllTradesOnTarget()
          ulong positionMagic = PositionGetInteger(POSITION_MAGIC);
          if (positionMagic == pairMagic[0] || positionMagic == pairMagic[1] || positionMagic == pairMagic[2])
          {
-            trade.PositionClose(ticket);
-            Print("Closed position for daily target: Ticket ", ticket);
+            if (trade.PositionClose(ticket))
+            {
+               Print("Closed position for daily target: Ticket ", ticket);
+            }
          }
       }
    }
